@@ -6,8 +6,10 @@ use tokio::runtime::Runtime;
 
 use web3::{
     contract::{Contract, Options},
-    signing::SecretKeyRef,
+    signing::{Key, SecretKeyRef},
+    transports::Http,
     types::{Address, U256},
+    Web3,
 };
 
 const BSC_MAINNET: &str = "https://bsc-dataseed1.binance.org";
@@ -15,6 +17,9 @@ const CONTRACT_MAINNET: &str = "0x6aa91cbfe045f9d154050226fcc830ddba886ced";
 
 const BSC_TESTNET: &str = "https://data-seed-prebsc-1-s1.binance.org:8545";
 const CONTRACT_TESTNET: &str = "0x816d8FB30bD109e75E339f341965f7B46E140C9a";
+
+const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
+const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
 
 fn main() {
     pnk!(run());
@@ -30,8 +35,8 @@ fn run() -> Result<()> {
         (BSC_MAINNET, CONTRACT_MAINNET)
     };
 
-    let transport = web3::transports::Http::new(url).c(d!())?;
-    let web3 = web3::Web3::new(transport);
+    let transport = Http::new(url).c(d!())?;
+    let web3 = Web3::new(transport);
 
     let prvk = fs::read_to_string(args.privkey_path)
         .c(d!())
@@ -63,7 +68,39 @@ fn run() -> Result<()> {
         entries.push((receiver, amount));
     }
 
-    for (receiver, amount) in entries.into_iter() {
+    let mut entries_old_balances = vec![];
+    for en in entries.iter() {
+        let balance: U256 = rt
+            .block_on(contract.query("balanceOf", (en.0,), None, Options::default(), None))
+            .c(d!())?;
+        entries_old_balances.push(balance.as_u128());
+    }
+
+    let sender = SecretKeyRef::new(&prvk).address();
+    let total_am = (entries
+        .iter()
+        .fold(entries.len() as f64, |acc, i| acc + i.1)
+        * (10u128.pow(18) as f64)) as u128;
+    let balance: U256 = rt
+        .block_on(contract.query("balanceOf", (sender,), None, Options::default(), None))
+        .c(d!())?;
+    let balance = balance.as_u128();
+    if total_am > balance {
+        let mint_am = total_am - balance;
+        rt.block_on(contract.signed_call_with_confirmations(
+            "mint",
+            (mint_am,),
+            Options::default(),
+            1,
+            SecretKeyRef::new(&prvk),
+        ))
+        .c(d!("Insufficient balance, and mint failed!"))?;
+
+        println!("\n=> Mint {}", to_float_str(mint_am));
+    }
+
+    println!("\n=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
+    for (receiver, amount) in entries.clone().into_iter() {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
         let options = Options {
             gas: Some(U256::from_dec_str("2000000").unwrap()),
@@ -78,19 +115,46 @@ fn run() -> Result<()> {
                 SecretKeyRef::new(&prvk),
             ))
             .c(d!())?;
-
         println!(
-            "Tx hash: {}, send_to: {}, amount: {}, result: {}",
-            ret.transaction_hash,
-            receiver,
-            amount,
+            "\n=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
             ret.status
-                .map(|r| alt!(1 == r.as_u32(), "success", "fail"))
-                .unwrap_or("fail")
+                .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
+                .unwrap_or(FAIL),
+            amount,
+            receiver,
+            ret.transaction_hash,
+        );
+    }
+
+    println!("\n=> \x1b[37;1mCheck on-chain results...\x1b[0m");
+    for ((receiver, amount), old_balance) in
+        entries.into_iter().zip(entries_old_balances.into_iter())
+    {
+        let am = (amount * (10u128.pow(18) as f64)) as u128;
+        let balance: U256 = rt
+            .block_on(contract.query("balanceOf", (receiver,), None, Options::default(), None))
+            .c(d!())?;
+        let balance = balance.as_u128();
+        println!(
+            "\n=> Result: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, SendTo: 0x{:x}",
+            alt!(am == balance - old_balance, GOOD, FAIL),
+            amount,
+            to_float_str(balance - old_balance),
+            to_float_str(old_balance),
+            to_float_str(balance),
+            receiver,
         );
     }
 
     Ok(())
+}
+
+fn to_float_str(n: u128) -> String {
+    let i = n / 10u128.pow(18);
+    let j = n - i * 10u128.pow(18);
+    (i.to_string() + "." + j.to_string().trim_end_matches('0'))
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 #[derive(Parser, Debug)]

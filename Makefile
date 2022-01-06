@@ -20,4 +20,5 @@ update:
 	cargo update
 
 test:
-	cargo run --release -- -t -e testnet/receiver.list -p testnet/owner.key
+	cargo run --release -- -t -e testnet/owner.entries -p testnet/owner.key
+	cargo run --release -- -t -e testnet/investor.entries -p testnet/investor.key
