@@ -1,5 +1,7 @@
 # plgr
 
+`make test`
+
 ## Usage
 
 ```
