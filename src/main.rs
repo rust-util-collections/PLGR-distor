@@ -2,7 +2,10 @@ use clap::Parser;
 use ruc::*;
 use secp256k1::SecretKey;
 use std::{fs, str::FromStr};
-use tokio::runtime::Runtime;
+use tokio::{
+    runtime::Runtime,
+    time::{sleep, Duration},
+};
 
 use web3::{
     contract::{Contract, Options},
@@ -92,11 +95,11 @@ fn run() -> Result<()> {
             "mint",
             (mint_am,),
             Options::default(),
-            1,
+            3,
             SecretKeyRef::new(&prvk),
         ))
         .c(d!("Insufficient balance, and mint failed!"))?;
-        println!("\n=> Mint {}", to_float_str(mint_am));
+        println!("=> Mint {}", to_float_str(mint_am));
     }
 
     let nonce = rt
@@ -104,7 +107,7 @@ fn run() -> Result<()> {
         .c(d!("Fail to get nonce"))?
         .as_u128();
 
-    println!("\n=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
+    println!("=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
     let mut res = vec![];
     for (i, (receiver, amount)) in entries.clone().into_iter().enumerate() {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
@@ -115,12 +118,12 @@ fn run() -> Result<()> {
         };
         let c = contract.clone();
         let hdr = rt.spawn(async move {
-            sleep_ms!(i as u64);
+            sleep(Duration::from_millis(100 * i as u64)).await;
             c.signed_call_with_confirmations(
                 "transfer",
                 (receiver, am),
                 options,
-                1,
+                3,
                 SecretKeyRef::new(&prvk),
             )
             .await
@@ -131,7 +134,7 @@ fn run() -> Result<()> {
     for (hdr, am, receiver) in res.into_iter() {
         let ret = rt.block_on(hdr).unwrap().c(d!())?;
         println!(
-            "\n=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
+            "=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
             ret.status
                 .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
                 .unwrap_or(FAIL),
@@ -141,7 +144,7 @@ fn run() -> Result<()> {
         );
     }
 
-    println!("\n=> \x1b[37;1mCheck on-chain results...\x1b[0m");
+    println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
     for ((receiver, amount), old_balance) in
         entries.into_iter().zip(entries_old_balances.into_iter())
     {
@@ -151,7 +154,7 @@ fn run() -> Result<()> {
             .c(d!())?;
         let balance = balance.as_u128();
         println!(
-            "\n=> Result: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, SendTo: 0x{:x}",
+            "=> Result: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, Receiver: 0x{:x}",
             alt!(am == balance - old_balance, GOOD, FAIL),
             amount,
             to_float_str(balance - old_balance),
