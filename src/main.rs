@@ -32,11 +32,14 @@ fn run() -> Result<()> {
     let rt = Runtime::new().c(d!())?;
     let args = Args::parse();
 
-    let (url, contract_addr) = if args.testnet {
-        (BSC_TESTNET, CONTRACT_TESTNET)
-    } else {
-        (BSC_MAINNET, CONTRACT_MAINNET)
-    };
+    let url = args
+        .rpc_addr
+        .as_deref()
+        .unwrap_or_else(|| alt!(args.bsc_testnet, BSC_TESTNET, BSC_MAINNET));
+    let contract_addr = args
+        .contract
+        .as_deref()
+        .unwrap_or_else(|| alt!(args.bsc_testnet, CONTRACT_TESTNET, CONTRACT_MAINNET));
 
     let transport = Http::new(url).c(d!())?;
     let web3 = Web3::new(transport);
@@ -178,13 +181,18 @@ fn to_float_str(n: u128) -> String {
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
-    #[clap(short, long)]
-    testnet: bool,
-    // A file contains how much to transfer:
-    // - 0xAAAAAAA...AAAAAAAAAA <amount>
-    // - ...
-    #[clap(short, long)]
+    #[clap(long, help = "Optional, default to BSC mainnet")]
+    bsc_testnet: bool,
+    #[clap(
+        short = 'p',
+        long,
+        help = "A file containing who and how much to transfer"
+    )]
     entries_path: String,
-    #[clap(short, long)]
+    #[clap(short = 'K', long, help = "A file containing your private key")]
     privkey_path: String,
+    #[clap(short = 'a', long, help = "Optional, like: http://***:8545")]
+    rpc_addr: Option<String>,
+    #[clap(short = 'c', long, help = "Optional, like: 0x816d8...40C9a")]
+    contract: Option<String>,
 }

@@ -20,5 +20,5 @@ update:
 	cargo update
 
 test:
-	cargo run --release -- -t -e testnet/owner.entries -p testnet/owner.key
-	cargo run --release -- -t -e testnet/investor.entries -p testnet/investor.key
+	cargo run --release -- --bsc-testnet -p testnet/owner.entries -K testnet/owner.key
+	cargo run --release -- --bsc-testnet -p testnet/investor.entries -K testnet/investor.key
