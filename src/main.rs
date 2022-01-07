@@ -53,6 +53,7 @@ fn run() -> Result<()> {
     let mut entries = vec![];
     for l in contents.lines() {
         let line = l.replace(" ", "");
+        alt!(line.is_empty(), continue);
         let en = line.split(',').collect::<Vec<_>>();
         if 2 != en.len() {
             return Err(eg!(format!("Invalid entry: {}", l)));
@@ -95,32 +96,46 @@ fn run() -> Result<()> {
             SecretKeyRef::new(&prvk),
         ))
         .c(d!("Insufficient balance, and mint failed!"))?;
-
         println!("\n=> Mint {}", to_float_str(mint_am));
     }
 
+    let nonce = rt
+        .block_on(web3.eth().transaction_count(sender, None))
+        .c(d!("Fail to get nonce"))?
+        .as_u128();
+
     println!("\n=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
-    for (receiver, amount) in entries.clone().into_iter() {
+    let mut res = vec![];
+    for (i, (receiver, amount)) in entries.clone().into_iter().enumerate() {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
         let options = Options {
-            gas: Some(U256::from_dec_str("2000000").unwrap()),
+            gas: Some(200_0000.into()),
+            nonce: Some((i as u128 + nonce).into()),
             ..Default::default()
         };
-        let ret = rt
-            .block_on(contract.signed_call_with_confirmations(
+        let c = contract.clone();
+        let hdr = rt.spawn(async move {
+            sleep_ms!(i as u64);
+            c.signed_call_with_confirmations(
                 "transfer",
                 (receiver, am),
                 options,
                 1,
                 SecretKeyRef::new(&prvk),
-            ))
-            .c(d!())?;
+            )
+            .await
+        });
+        res.push((hdr, amount, receiver));
+    }
+
+    for (hdr, am, receiver) in res.into_iter() {
+        let ret = rt.block_on(hdr).unwrap().c(d!())?;
         println!(
             "\n=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
             ret.status
                 .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
                 .unwrap_or(FAIL),
-            amount,
+            am,
             receiver,
             ret.transaction_hash,
         );
@@ -140,8 +155,8 @@ fn run() -> Result<()> {
             alt!(am == balance - old_balance, GOOD, FAIL),
             amount,
             to_float_str(balance - old_balance),
-            to_float_str(old_balance),
             to_float_str(balance),
+            to_float_str(old_balance),
             receiver,
         );
     }
