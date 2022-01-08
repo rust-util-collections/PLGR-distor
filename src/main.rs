@@ -23,6 +23,7 @@ const CONTRACT_TESTNET: &str = "0x816d8FB30bD109e75E339f341965f7B46E140C9a";
 
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
+const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
 
 fn main() {
     pnk!(run());
@@ -73,6 +74,13 @@ fn run() -> Result<()> {
             .or_else(|_| en[1].parse::<u128>().map(|am| am as f64))
             .c(d!(format!("Invalid amount: {}", l)))?;
         entries.push((receiver, amount));
+    }
+
+    let original_len = entries.len();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0);
+    if original_len > entries.len() {
+        return Err(eg!("Duplicate receiver[s] found!"));
     }
 
     let mut entries_old_balances = vec![];
@@ -140,7 +148,7 @@ fn run() -> Result<()> {
             "=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
             ret.status
                 .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
-                .unwrap_or(FAIL),
+                .unwrap_or(UNKNOWN),
             am,
             receiver,
             ret.transaction_hash,
