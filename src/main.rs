@@ -179,9 +179,21 @@ fn run() -> Result<()> {
 }
 
 fn to_float_str(n: u128) -> String {
-    let i = n / 10u128.pow(18);
-    let j = n - i * 10u128.pow(18);
-    (i.to_string() + "." + j.to_string().trim_end_matches('0'))
+    let base = 10u128.pow(18);
+    let i = n / base;
+    let j = n - i * base;
+
+    let pads = if 0 == i {
+        18 - (1..18)
+            .into_iter()
+            .find(|&k| 0 == j / 10u128.pow(k))
+            .unwrap()
+    } else {
+        0
+    };
+    let pads = (0..pads).map(|_| '0').collect::<String>();
+
+    (i.to_string() + "." + &pads + j.to_string().trim_end_matches('0'))
         .trim_end_matches('.')
         .to_owned()
 }
