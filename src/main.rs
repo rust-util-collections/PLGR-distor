@@ -1,7 +1,7 @@
 use clap::Parser;
 use ruc::*;
 use secp256k1::SecretKey;
-use std::{fs, str::FromStr};
+use std::{collections::BTreeMap, fs, str::FromStr, sync::mpsc::channel};
 use tokio::{
     runtime::Runtime,
     time::{sleep, Duration},
@@ -76,19 +76,26 @@ fn run() -> Result<()> {
         entries.push((receiver, amount));
     }
 
-    let original_len = entries.len();
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries.dedup_by(|a, b| a.0 == b.0);
-    if original_len > entries.len() {
-        return Err(eg!("Duplicate receiver[s] found!"));
+    let mut entries_pre_balances = BTreeMap::new();
+    let (s, r) = channel();
+    for (i, en) in entries.iter().enumerate() {
+        let ss = s.clone();
+        let data = (en.0,);
+        let c = contract.clone();
+        rt.spawn(async move {
+            sleep(Duration::from_millis(100 * i as u64)).await;
+            let balance: U256 = c
+                .query("balanceOf", data, None, Options::default(), None)
+                .await
+                .unwrap();
+            ss.send((i, balance.as_u128())).unwrap();
+        });
     }
 
-    let mut entries_old_balances = vec![];
-    for en in entries.iter() {
-        let balance: U256 = rt
-            .block_on(contract.query("balanceOf", (en.0,), None, Options::default(), None))
-            .c(d!())?;
-        entries_old_balances.push(balance.as_u128());
+    for idx in 0..entries.len() {
+        let (i, balance) = r.recv().unwrap();
+        entries_pre_balances.insert(i, balance);
+        println!("Querying pre-balances: {}", idx);
     }
 
     let sender = SecretKeyRef::new(&prvk).address();
@@ -123,7 +130,6 @@ fn run() -> Result<()> {
     for (i, (receiver, amount)) in entries.clone().into_iter().enumerate() {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
         let options = Options {
-            gas: Some(200_0000.into()),
             nonce: Some((i as u128 + nonce).into()),
             ..Default::default()
         };
@@ -142,7 +148,7 @@ fn run() -> Result<()> {
         res.push((hdr, amount, receiver));
     }
 
-    for (hdr, am, receiver) in res.into_iter() {
+    for (idx, (hdr, am, receiver)) in res.into_iter().enumerate() {
         let ret = rt.block_on(hdr).unwrap().c(d!())?;
         println!(
             "=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
@@ -153,11 +159,14 @@ fn run() -> Result<()> {
             receiver,
             ret.transaction_hash,
         );
+        println!("Sending transactions: {}", idx);
     }
 
     println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
-    for ((receiver, amount), old_balance) in
-        entries.into_iter().zip(entries_old_balances.into_iter())
+    for (idx, ((receiver, amount), pre_balance)) in entries
+        .into_iter()
+        .zip(entries_pre_balances.into_iter().map(|(_, v)| v))
+        .enumerate()
     {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
         let balance: U256 = rt
@@ -166,13 +175,14 @@ fn run() -> Result<()> {
         let balance = balance.as_u128();
         println!(
             "=> Result: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, Receiver: 0x{:x}",
-            alt!(am == balance - old_balance, GOOD, FAIL),
+            alt!(am == balance - pre_balance, GOOD, FAIL),
             amount,
-            to_float_str(balance - old_balance),
+            to_float_str(balance - pre_balance),
             to_float_str(balance),
-            to_float_str(old_balance),
+            to_float_str(pre_balance),
             receiver,
         );
+        println!("Querying post-balances: {}", idx);
     }
 
     Ok(())
