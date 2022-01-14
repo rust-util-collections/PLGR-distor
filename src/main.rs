@@ -1,7 +1,13 @@
 use clap::Parser;
 use ruc::*;
 use secp256k1::SecretKey;
-use std::{collections::BTreeMap, fs, str::FromStr, sync::mpsc::channel};
+use std::{
+    collections::BTreeMap,
+    fs,
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::mpsc::channel,
+};
 use tokio::{
     runtime::Runtime,
     time::{sleep, Duration},
@@ -24,6 +30,8 @@ const CONTRACT_TESTNET: &str = "0xffe5548b5c3023b3277c1a6f24ac6382a0087db5";
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
 const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
+
+static PRINT_IDX: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     pnk!(run());
@@ -57,7 +65,7 @@ fn run() -> Result<()> {
 
     let contents = fs::read_to_string(args.entries_path).c(d!())?;
 
-    let mut entries = vec![];
+    let mut entries = BTreeMap::new();
     for l in contents.lines() {
         let line = l.replace(" ", "");
         alt!(line.is_empty(), continue);
@@ -73,10 +81,10 @@ fn run() -> Result<()> {
             .parse::<f64>()
             .or_else(|_| en[1].parse::<u128>().map(|am| am as f64))
             .c(d!(format!("Invalid amount: {}", l)))?;
-        entries.push((receiver, amount));
+        *entries.entry(receiver).or_insert(0.0) += amount;
     }
 
-    for batch in entries.chunks(20) {
+    for batch in entries.into_iter().collect::<Vec<_>>().chunks(100) {
         run_batch(&web3, &rt, batch, prvk, &contract).c(d!())?;
     }
 
@@ -90,26 +98,26 @@ fn run_batch(
     prvk: SecretKey,
     contract: &Contract<Http>,
 ) -> Result<()> {
-    let mut entries_pre_balances = BTreeMap::new();
     let (s, r) = channel();
-    for (i, en) in entries.iter().enumerate() {
+    for (idx, en) in entries.iter().enumerate() {
         let ss = s.clone();
         let data = (en.0,);
         let c = contract.clone();
         rt.spawn(async move {
-            sleep(Duration::from_millis(10 * i as u64)).await;
+            sleep(Duration::from_millis(10 * idx as u64)).await;
             let balance: U256 = c
                 .query("balanceOf", data, None, Options::default(), None)
                 .await
                 .unwrap();
-            ss.send((i, balance.as_u128())).unwrap();
+            ss.send((idx, balance.as_u128())).unwrap();
         });
     }
 
+    let mut entries_pre_balances = BTreeMap::new();
     for idx in 0..entries.len() {
         let (i, balance) = r.recv().unwrap();
         entries_pre_balances.insert(i, balance);
-        println!("Querying pre-balances: {}", idx);
+        println!("Querying pre-balances nth-{}", idx);
     }
 
     let sender = SecretKeyRef::new(&prvk).address();
@@ -123,6 +131,7 @@ fn run_batch(
     let balance = balance.as_u128();
     if total_am > balance {
         let mint_am = total_am - balance;
+        println!("=> Minting: {}", to_float_str(mint_am));
         rt.block_on(contract.signed_call_with_confirmations(
             "mint",
             (mint_am,),
@@ -131,7 +140,6 @@ fn run_batch(
             SecretKeyRef::new(&prvk),
         ))
         .c(d!("Insufficient balance, and mint failed!"))?;
-        println!("=> Mint {}", to_float_str(mint_am));
     }
 
     let nonce = rt
@@ -140,64 +148,61 @@ fn run_batch(
         .as_u128();
 
     println!("=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
-    let mut res = vec![];
-    for (i, (receiver, amount)) in entries.iter().copied().enumerate() {
-        let am = (amount * (10u128.pow(18) as f64)) as u128;
-        let options = Options {
-            nonce: Some((i as u128 + nonce).into()),
-            ..Default::default()
-        };
-        let c = contract.clone();
-        let hdr = rt.spawn(async move {
-            sleep(Duration::from_millis(50 * i as u64)).await;
-            c.signed_call_with_confirmations(
-                "transfer",
-                (receiver, am),
-                options,
-                2,
-                SecretKeyRef::new(&prvk),
-            )
-            .await
+    for (idx, (receiver, amount)) in entries.iter().copied().enumerate() {
+        rt.block_on(async {
+            let am = (amount * (10u128.pow(18) as f64)) as u128;
+            let options = Options {
+                nonce: Some((idx as u128 + nonce).into()),
+                ..Default::default()
+            };
+            let ret = contract
+                .signed_call_with_confirmations(
+                    "transfer",
+                    (receiver, am),
+                    options,
+                    0,
+                    SecretKeyRef::new(&prvk),
+                )
+                .await
+                .unwrap();
+            println!(
+                "=> Result-{}: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
+                idx,
+                ret.status
+                    .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
+                    .unwrap_or(UNKNOWN),
+                am,
+                receiver,
+                ret.transaction_hash,
+            );
         });
-        res.push((hdr, amount, receiver));
-    }
-
-    for (idx, (hdr, am, receiver)) in res.into_iter().enumerate() {
-        let ret = rt.block_on(hdr).unwrap().c(d!())?;
-        println!(
-            "=> Result: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
-            ret.status
-                .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
-                .unwrap_or(UNKNOWN),
-            am,
-            receiver,
-            ret.transaction_hash,
-        );
-        println!("Sending transactions: {}", idx);
     }
 
     println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
+    PRINT_IDX.store(0, Ordering::Relaxed);
     for (idx, ((receiver, amount), pre_balance)) in entries
         .iter()
         .copied()
         .zip(entries_pre_balances.into_iter().map(|(_, v)| v))
         .enumerate()
     {
-        let am = (amount * (10u128.pow(18) as f64)) as u128;
-        let balance: U256 = rt
-            .block_on(contract.query("balanceOf", (receiver,), None, Options::default(), None))
-            .c(d!())?;
-        let balance = balance.as_u128();
-        println!(
-            "=> Result: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, Receiver: 0x{:x}",
-            alt!(am == balance - pre_balance, GOOD, FAIL),
-            amount,
-            to_float_str(balance - pre_balance),
-            to_float_str(balance),
-            to_float_str(pre_balance),
-            receiver,
-        );
-        println!("Querying post-balances: {}", idx);
+        let c = contract.clone();
+        rt.spawn(async move {
+            let am = (amount * (10u128.pow(18) as f64)) as u128;
+            sleep(Duration::from_millis(10 * idx as u64)).await;
+            let balance: U256 = c.query("balanceOf", (receiver,), None, Options::default(), None).await.unwrap();
+            let balance = balance.as_u128();
+            println!(
+                "=> Result-{}: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, Receiver: 0x{:x}",
+                PRINT_IDX.fetch_add(1, Ordering::Relaxed),
+                alt!(am == balance - pre_balance, GOOD, FAIL),
+                amount,
+                to_float_str(balance - pre_balance),
+                to_float_str(balance),
+                to_float_str(pre_balance),
+                receiver,
+            );
+        });
     }
 
     Ok(())
