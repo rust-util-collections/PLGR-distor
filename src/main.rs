@@ -19,7 +19,7 @@ const BSC_MAINNET: &str = "https://bsc-dataseed1.binance.org";
 const CONTRACT_MAINNET: &str = "0x6aa91cbfe045f9d154050226fcc830ddba886ced";
 
 const BSC_TESTNET: &str = "https://data-seed-prebsc-1-s1.binance.org:8545";
-const CONTRACT_TESTNET: &str = "0x816d8FB30bD109e75E339f341965f7B46E140C9a";
+const CONTRACT_TESTNET: &str = "0xffe5548b5c3023b3277c1a6f24ac6382a0087db5";
 
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
@@ -76,6 +76,20 @@ fn run() -> Result<()> {
         entries.push((receiver, amount));
     }
 
+    for batch in entries.chunks(20) {
+        run_batch(&web3, &rt, batch, prvk, &contract).c(d!())?;
+    }
+
+    Ok(())
+}
+
+fn run_batch(
+    web3: &Web3<Http>,
+    rt: &Runtime,
+    entries: &[(Address, f64)],
+    prvk: SecretKey,
+    contract: &Contract<Http>,
+) -> Result<()> {
     let mut entries_pre_balances = BTreeMap::new();
     let (s, r) = channel();
     for (i, en) in entries.iter().enumerate() {
@@ -83,7 +97,7 @@ fn run() -> Result<()> {
         let data = (en.0,);
         let c = contract.clone();
         rt.spawn(async move {
-            sleep(Duration::from_millis(100 * i as u64)).await;
+            sleep(Duration::from_millis(10 * i as u64)).await;
             let balance: U256 = c
                 .query("balanceOf", data, None, Options::default(), None)
                 .await
@@ -113,7 +127,7 @@ fn run() -> Result<()> {
             "mint",
             (mint_am,),
             Options::default(),
-            3,
+            2,
             SecretKeyRef::new(&prvk),
         ))
         .c(d!("Insufficient balance, and mint failed!"))?;
@@ -127,7 +141,7 @@ fn run() -> Result<()> {
 
     println!("=> \x1b[37;1mSending from: 0x{:x}\x1b[0m", sender);
     let mut res = vec![];
-    for (i, (receiver, amount)) in entries.clone().into_iter().enumerate() {
+    for (i, (receiver, amount)) in entries.iter().copied().enumerate() {
         let am = (amount * (10u128.pow(18) as f64)) as u128;
         let options = Options {
             nonce: Some((i as u128 + nonce).into()),
@@ -135,12 +149,12 @@ fn run() -> Result<()> {
         };
         let c = contract.clone();
         let hdr = rt.spawn(async move {
-            sleep(Duration::from_millis(100 * i as u64)).await;
+            sleep(Duration::from_millis(50 * i as u64)).await;
             c.signed_call_with_confirmations(
                 "transfer",
                 (receiver, am),
                 options,
-                3,
+                2,
                 SecretKeyRef::new(&prvk),
             )
             .await
@@ -164,7 +178,8 @@ fn run() -> Result<()> {
 
     println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
     for (idx, ((receiver, amount), pre_balance)) in entries
-        .into_iter()
+        .iter()
+        .copied()
         .zip(entries_pre_balances.into_iter().map(|(_, v)| v))
         .enumerate()
     {
@@ -194,7 +209,7 @@ fn to_float_str(n: u128) -> String {
     let j = n - i * base;
 
     let pads = if 0 == i {
-        18 - (1..18)
+        18 - (1..=18)
             .into_iter()
             .find(|&k| 0 == j / 10u128.pow(k))
             .unwrap()
