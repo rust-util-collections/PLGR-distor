@@ -29,7 +29,7 @@ const CONTRACT_TESTNET: &str = "0xffe5548b5c3023b3277c1a6f24ac6382a0087db5";
 
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
-const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
+// const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
 
 static PRINT_IDX: AtomicU64 = AtomicU64::new(0);
 
@@ -44,11 +44,12 @@ fn run() -> Result<()> {
     let url = args
         .rpc_addr
         .as_deref()
-        .unwrap_or_else(|| alt!(args.bsc_testnet, BSC_TESTNET, BSC_MAINNET));
-    let contract_addr = args
-        .contract
-        .as_deref()
-        .unwrap_or_else(|| alt!(args.bsc_testnet, CONTRACT_TESTNET, CONTRACT_MAINNET));
+        .unwrap_or(alt!(args.bsc_testnet, BSC_TESTNET, BSC_MAINNET));
+    let contract_addr = args.contract.as_deref().unwrap_or(alt!(
+        args.bsc_testnet,
+        CONTRACT_TESTNET,
+        CONTRACT_MAINNET
+    ));
 
     let transport = Http::new(url).c(d!())?;
     let web3 = Web3::new(transport);
@@ -65,9 +66,9 @@ fn run() -> Result<()> {
 
     let contents = fs::read_to_string(args.entries_path).c(d!())?;
 
-    let mut entries = BTreeMap::new();
+    let mut entries = vec![];
     for l in contents.lines() {
-        let line = l.replace(" ", "");
+        let line = l.replace(' ', "");
         alt!(line.is_empty(), continue);
         let en = line.split(',').collect::<Vec<_>>();
         if 2 != en.len() {
@@ -81,10 +82,10 @@ fn run() -> Result<()> {
             .parse::<f64>()
             .or_else(|_| en[1].parse::<u128>().map(|am| am as f64))
             .c(d!(format!("Invalid amount: {}", l)))?;
-        *entries.entry(receiver).or_insert(0.0) += amount;
+        entries.push((receiver, amount));
     }
 
-    for batch in entries.into_iter().collect::<Vec<_>>().chunks(100) {
+    for batch in entries.chunks(50) {
         run_batch(&web3, &rt, batch, prvk, &contract).c(d!())?;
     }
 
@@ -101,15 +102,16 @@ fn run_batch(
     let (s, r) = channel();
     for (idx, en) in entries.iter().enumerate() {
         let ss = s.clone();
-        let data = (en.0,);
+        let receiver = en.0;
+        let data = (receiver,);
         let c = contract.clone();
         rt.spawn(async move {
-            sleep(Duration::from_millis(10 * idx as u64)).await;
+            sleep(Duration::from_millis(20 * idx as u64)).await;
             let balance: U256 = c
                 .query("balanceOf", data, None, Options::default(), None)
                 .await
                 .unwrap();
-            ss.send((idx, balance.as_u128())).unwrap();
+            ss.send((receiver, balance.as_u128())).unwrap();
         });
     }
 
@@ -130,16 +132,22 @@ fn run_batch(
         .c(d!())?;
     let balance = balance.as_u128();
     if total_am > balance {
-        let mint_am = total_am - balance;
+        let mint_am = (total_am - balance) * 100;
         println!("=> Minting: {}", to_float_str(mint_am));
-        rt.block_on(contract.signed_call_with_confirmations(
+        rt.block_on(contract.signed_call(
             "mint",
             (mint_am,),
             Options::default(),
-            2,
             SecretKeyRef::new(&prvk),
         ))
         .c(d!("Insufficient balance, and mint failed!"))?;
+        sleep_ms!(5000);
+        let new_balance: U256 = rt
+            .block_on(contract.query("balanceOf", (sender,), None, Options::default(), None))
+            .c(d!())?;
+        if new_balance.as_u128() - balance != mint_am {
+            return Err(eg!("Insufficient balance, and mint failed!"));
+        }
     }
 
     let nonce = rt
@@ -155,41 +163,44 @@ fn run_batch(
                 nonce: Some((idx as u128 + nonce).into()),
                 ..Default::default()
             };
-            let ret = contract
-                .signed_call_with_confirmations(
-                    "transfer",
-                    (receiver, am),
-                    options,
-                    0,
-                    SecretKeyRef::new(&prvk),
-                )
-                .await
-                .unwrap();
+            let transaction_hash = pnk!(
+                contract
+                    .signed_call(
+                        "transfer",
+                        (receiver, am),
+                        options,
+                        SecretKeyRef::new(&prvk),
+                    )
+                    .await
+            );
             println!(
-                "=> Result-{}: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}",
-                idx,
-                ret.status
-                    .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
-                    .unwrap_or(UNKNOWN),
-                am,
-                receiver,
-                ret.transaction_hash,
+                "=> [ Entry-{} ], Amount: {}, SendTo: 0x{:x}, TxHash: {}",
+                idx, am, receiver, transaction_hash,
             );
         });
     }
 
+    sleep_ms!(10_000);
+
     println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
     PRINT_IDX.store(0, Ordering::Relaxed);
-    for (idx, ((receiver, amount), pre_balance)) in entries
+    let mut hdrs = vec![];
+    let ets = entries
         .iter()
         .copied()
+        .fold(BTreeMap::new(), |mut acc, (k, v)| {
+            *acc.entry(k).or_insert(0.0) += v;
+            acc
+        });
+    for (idx, ((receiver, amount), pre_balance)) in ets
+        .into_iter()
         .zip(entries_pre_balances.into_iter().map(|(_, v)| v))
         .enumerate()
     {
         let c = contract.clone();
-        rt.spawn(async move {
+        let hdr = rt.spawn(async move {
             let am = (amount * (10u128.pow(18) as f64)) as u128;
-            sleep(Duration::from_millis(10 * idx as u64)).await;
+            sleep(Duration::from_millis(20 * idx as u64)).await;
             let balance: U256 = c.query("balanceOf", (receiver,), None, Options::default(), None).await.unwrap();
             let balance = balance.as_u128();
             println!(
@@ -203,6 +214,11 @@ fn run_batch(
                 receiver,
             );
         });
+        hdrs.push(hdr);
+    }
+
+    for hdr in hdrs.into_iter() {
+        rt.block_on(hdr).unwrap();
     }
 
     Ok(())
