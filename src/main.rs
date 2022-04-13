@@ -29,7 +29,7 @@ const CONTRACT_TESTNET: &str = "0xffe5548b5c3023b3277c1a6f24ac6382a0087db5";
 
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
-const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
+// const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
 
 static PRINT_IDX: AtomicU64 = AtomicU64::new(0);
 
@@ -132,23 +132,21 @@ fn run_batch(
         .c(d!())?;
     let balance = balance.as_u128();
     if total_am > balance {
-        let mint_am = (total_am - balance) * 10000;
+        let mint_am = (total_am - balance) * 100;
         println!("=> Minting: {}", to_float_str(mint_am));
-        let receipt = rt
-            .block_on(contract.signed_call_with_confirmations(
-                "mint",
-                (mint_am,),
-                Options::default(),
-                2,
-                SecretKeyRef::new(&prvk),
-            ))
-            .c(d!("Insufficient balance, and mint failed!"))?;
-        if let Some(status) = receipt.status {
-            if 1 != status.as_u32() {
-                return Err(eg!(serde_json::to_string(&receipt.logs).unwrap()));
-            }
-        } else {
-            return Err(eg!(serde_json::to_string(&receipt.logs).unwrap()));
+        rt.block_on(contract.signed_call(
+            "mint",
+            (mint_am,),
+            Options::default(),
+            SecretKeyRef::new(&prvk),
+        ))
+        .c(d!("Insufficient balance, and mint failed!"))?;
+        sleep_ms!(5000);
+        let new_balance: U256 = rt
+            .block_on(contract.query("balanceOf", (sender,), None, Options::default(), None))
+            .c(d!())?;
+        if new_balance.as_u128() - balance != mint_am {
+            return Err(eg!("Insufficient balance, and mint failed!"));
         }
     }
 
@@ -165,27 +163,19 @@ fn run_batch(
                 nonce: Some((idx as u128 + nonce).into()),
                 ..Default::default()
             };
-            let ret = pnk!(
+            let transaction_hash = pnk!(
                 contract
-                    .signed_call_with_confirmations(
+                    .signed_call(
                         "transfer",
                         (receiver, am),
                         options,
-                        0,
                         SecretKeyRef::new(&prvk),
                     )
                     .await
             );
             println!(
-                "=> Result-{}: {}, Amount: {}, SendTo: 0x{:x}, TxHash: {}, Log: {}",
-                idx,
-                ret.status
-                    .map(|r| alt!(1 == r.as_u32(), GOOD, FAIL))
-                    .unwrap_or(UNKNOWN),
-                am,
-                receiver,
-                ret.transaction_hash,
-                serde_json::to_string(&ret.logs).unwrap(),
+                "=> [ Entry-{} ], Amount: {}, SendTo: 0x{:x}, TxHash: {}",
+                idx, am, receiver, transaction_hash,
             );
         });
     }
