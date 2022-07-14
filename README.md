@@ -57,6 +57,11 @@ make test
 ```shell
 make release
 
+# maybe need some proxy settings:
+# - export HTTP_PROXY="127.0.0.1:19180"
+# - export HTTPS_PROXY="127.0.0.1:19180"
+# - ...
+
 # use the official contract
 ./target/release/plgr -p <file path to your entries> -K <file path to private key>
 

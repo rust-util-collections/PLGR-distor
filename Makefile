@@ -7,11 +7,7 @@ build:
 	cargo build
 
 release:
-	if [[ "Linux" == `uname -s` ]]; then\
-	    cargo build --release --target=x86_64-unknown-linux-musl;\
-	else\
-	    cargo build --release;\
-	fi
+	cargo build --release
 
 fmt:
 	cargo fmt
