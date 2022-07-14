@@ -1,18 +1,8 @@
 use clap::Parser;
 use ruc::*;
 use secp256k1::SecretKey;
-use std::{
-    collections::BTreeMap,
-    fs,
-    str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc::channel,
-};
-use tokio::{
-    runtime::Runtime,
-    time::{sleep, Duration},
-};
-
+use std::{collections::BTreeMap, fs, str::FromStr};
+use tokio::runtime::Runtime;
 use web3::{
     contract::{Contract, Options},
     signing::{Key, SecretKeyRef},
@@ -21,7 +11,7 @@ use web3::{
     Web3,
 };
 
-const BSC_MAINNET: &str = "https://bsc-dataseed1.binance.org";
+const BSC_MAINNET: &str = "https://bsc-dataseed3.binance.org";
 const CONTRACT_MAINNET: &str = "0x6aa91cbfe045f9d154050226fcc830ddba886ced";
 
 const BSC_TESTNET: &str = "https://data-seed-prebsc-1-s1.binance.org:8545";
@@ -30,8 +20,6 @@ const CONTRACT_TESTNET: &str = "0xffe5548b5c3023b3277c1a6f24ac6382a0087db5";
 const GOOD: &str = "\x1b[35;01mGOOD\x1b[0m";
 const FAIL: &str = "\x1b[31;01mFAIL\x1b[0m";
 // const UNKNOWN: &str = "\x1b[39;01mUNKNOWN\x1b[0m";
-
-static PRINT_IDX: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     pnk!(run());
@@ -85,7 +73,8 @@ fn run() -> Result<()> {
         entries.push((receiver, amount));
     }
 
-    for batch in entries.chunks(50) {
+    for (idx, batch) in entries.chunks(50).enumerate() {
+        println!("Chunk index(start from 0): {}", idx);
         run_batch(&web3, &rt, batch, prvk, &contract).c(d!())?;
     }
 
@@ -99,28 +88,7 @@ fn run_batch(
     prvk: SecretKey,
     contract: &Contract<Http>,
 ) -> Result<()> {
-    let (s, r) = channel();
-    for (idx, en) in entries.iter().enumerate() {
-        let ss = s.clone();
-        let receiver = en.0;
-        let data = (receiver,);
-        let c = contract.clone();
-        rt.spawn(async move {
-            sleep(Duration::from_millis(20 * idx as u64)).await;
-            let balance: U256 = c
-                .query("balanceOf", data, None, Options::default(), None)
-                .await
-                .unwrap();
-            ss.send((receiver, balance.as_u128())).unwrap();
-        });
-    }
-
-    let mut entries_pre_balances = BTreeMap::new();
-    for idx in 0..entries.len() {
-        let (i, balance) = r.recv().unwrap();
-        entries_pre_balances.insert(i, balance);
-        println!("Querying pre-balances nth-{}", idx);
-    }
+    let entries_pre_balances = get_balances(rt, entries, contract).c(d!())?;
 
     let sender = SecretKeyRef::new(&prvk).address();
     let total_am = (entries
@@ -175,16 +143,19 @@ fn run_batch(
             );
             println!(
                 "=> [ Entry-{} ], Amount: {}, SendTo: 0x{:x}, TxHash: {}",
-                idx, am, receiver, transaction_hash,
+                idx,
+                to_float_str(am),
+                receiver,
+                transaction_hash,
             );
         });
     }
 
+    println!("=> \x1b[37;1mSleep 10 seconds, and check on-chain results...\x1b[0m");
     sleep_ms!(10_000);
 
-    println!("=> \x1b[37;1mCheck on-chain results...\x1b[0m");
-    PRINT_IDX.store(0, Ordering::Relaxed);
-    let mut hdrs = vec![];
+    let mut fail_cnter = 0;
+
     let ets = entries
         .iter()
         .copied()
@@ -197,31 +168,79 @@ fn run_batch(
         .zip(entries_pre_balances.into_iter().map(|(_, v)| v))
         .enumerate()
     {
-        let c = contract.clone();
-        let hdr = rt.spawn(async move {
-            let am = (amount * (10u128.pow(18) as f64)) as u128;
-            sleep(Duration::from_millis(20 * idx as u64)).await;
-            let balance: U256 = c.query("balanceOf", (receiver,), None, Options::default(), None).await.unwrap();
+        let am = (amount * (10u128.pow(18) as f64)) as u128;
+        let mut cnter = 2;
+        let (status, balance) = loop {
+            let balance: U256 = rt
+                .block_on(contract.query("balanceOf", (receiver,), None, Options::default(), None))
+                .c(d!())
+                .or_else(|e| {
+                    sleep_ms!(200);
+                    rt.block_on(contract.query(
+                        "balanceOf",
+                        (receiver,),
+                        None,
+                        Options::default(),
+                        None,
+                    ))
+                    .c(d!(e))
+                })?;
             let balance = balance.as_u128();
-            println!(
+            if am / 10u128.pow(15) == (balance - pre_balance) / 10u128.pow(15) {
+                break (GOOD, balance);
+            } else if 0 == cnter {
+                fail_cnter += 1;
+                break (FAIL, balance);
+            } else {
+                cnter -= 1;
+                sleep_ms!(3000);
+            }
+        };
+        println!(
                 "=> Result-{}: {}, Amount: {}, BalanceDiff: {}, NewBalance: {}, OldBalance: {}, Receiver: 0x{:x}",
-                PRINT_IDX.fetch_add(1, Ordering::Relaxed),
-                alt!(am == balance - pre_balance, GOOD, FAIL),
+                idx,
+                status,
                 amount,
                 to_float_str(balance - pre_balance),
                 to_float_str(balance),
                 to_float_str(pre_balance),
                 receiver,
             );
-        });
-        hdrs.push(hdr);
     }
 
-    for hdr in hdrs.into_iter() {
-        rt.block_on(hdr).unwrap();
+    if 0 < fail_cnter {
+        Err(eg!("!! {} entries failed !!", fail_cnter))
+    } else {
+        Ok(())
+    }
+}
+
+fn get_balances(
+    rt: &Runtime,
+    entries: &[(Address, f64)],
+    contract: &Contract<Http>,
+) -> Result<BTreeMap<Address, u128>> {
+    let mut balances = BTreeMap::new();
+
+    for (idx, en) in entries.iter().enumerate() {
+        let receiver = en.0;
+        let data = (receiver,);
+        let balance: U256 = rt
+            .block_on(contract.query("balanceOf", data, None, Options::default(), None))
+            .c(d!())
+            .or_else(|e| {
+                sleep_ms!(200);
+                rt.block_on(contract.query("balanceOf", data, None, Options::default(), None))
+                    .c(d!(e))
+            })?;
+        println!(
+            "Got balance nth: {}, addr: 0x{:x}, amount: {}",
+            idx, receiver, balance
+        );
+        balances.insert(receiver, balance.as_u128());
     }
 
-    Ok(())
+    Ok(balances)
 }
 
 fn to_float_str(n: u128) -> String {
