@@ -158,7 +158,10 @@ fn run_batch(
             );
             println!(
                 "=> [ Entry-{} ], Amount: {}, SendTo: 0x{:x}, TxHash: {}",
-                idx, am, receiver, transaction_hash,
+                idx,
+                to_float_str(am),
+                receiver,
+                transaction_hash,
             );
         });
     }
@@ -187,14 +190,14 @@ fn run_batch(
             let am = (amount * (10u128.pow(18) as f64)) as u128;
             sleep(Duration::from_millis(20 * idx as u64)).await;
             let mut cnter = 2;
-            let status = loop {
+            let (status, balance) = loop {
                 let balance: U256 = c.query("balanceOf", (receiver,), None, Options::default(), None).await.unwrap();
                 let balance = balance.as_u128();
                 if am / 10u128.pow(15) == (balance - pre_balance) / 10u128.pow(15) {
-                    break GOOD;
+                    break (GOOD, balance);
                 } else if 0 == cnter {
                     fc.fetch_add(1, Ordering::Relaxed);
-                    break FAIL;
+                    break (FAIL, balance);
                 } else {
                     cnter -= 1;
                     sleep_ms!(3000);
