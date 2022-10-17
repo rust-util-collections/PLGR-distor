@@ -1,4 +1,4 @@
-all: release
+all: install
 
 lint:
 	cargo clippy
@@ -8,6 +8,9 @@ build:
 
 release:
 	cargo build --release
+
+install:
+	cargo install --path .
 
 fmt:
 	cargo fmt
